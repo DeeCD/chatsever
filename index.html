@@ -1,0 +1,146 @@
+// === Cloudflare Workers 纯服务端代码（无客户端逻辑） ===
+// 核心功能：管理WebSocket连接、转发消息、统计在线人数
+export default {
+  async fetch(request, env, ctx) {
+    // 仅处理WebSocket升级请求，拒绝普通HTTP请求
+    const upgradeHeader = request.headers.get("Upgrade");
+    if (!upgradeHeader || upgradeHeader !== "websocket") {
+      return new Response(
+        "这是Cloudflare WebSocket服务端，仅接受WebSocket连接请求",
+        { status: 400 }
+      );
+    }
+
+    // 创建WebSocket配对（服务端<->客户端）
+    const [clientWs, serverWs] = Object.values(new WebSocketPair());
+    // 处理服务端WebSocket会话
+    await handleServerWebSocket(serverWs, env, ctx);
+
+    // 返回101状态，完成WebSocket升级
+    return new Response(null, {
+      status: 101,
+      webSocket: clientWs,
+      headers: {
+        "Upgrade": "websocket",
+        "Connection": "Upgrade",
+        "Access-Control-Allow-Origin": "*", // 允许跨域（本地客户端连接必备）
+      },
+    });
+  },
+};
+
+// 存储所有在线客户端连接（key: WebSocket对象, value: 客户端信息）
+const onlineClients = new Map();
+
+/**
+ * 服务端核心逻辑：处理单个WebSocket连接的全生命周期
+ * @param {WebSocket} serverWs - 服务端WebSocket对象
+ * @param {Env} env - Cloudflare Workers环境变量
+ * @param {ExecutionContext} ctx - 执行上下文
+ */
+async function handleServerWebSocket(serverWs, env, ctx) {
+  // 生成客户端唯一标识
+  const clientId = crypto.randomUUID();
+  // 获取客户端IP（Cloudflare提供的真实IP）
+  const clientIp = serverWs.remoteAddress || "未知IP";
+  const connectTime = new Date().toLocaleString();
+
+  // 1. 客户端连接成功：记录连接信息
+  onlineClients.set(serverWs, {
+    id: clientId,
+    ip: clientIp,
+    connectTime: connectTime
+  });
+  console.log(`[服务端] 客户端 ${clientId} (${clientIp}) 已连接 | 在线数: ${onlineClients.size}`);
+
+  // 广播「新客户端连接」系统消息
+  broadcastSystemMessage(`客户端 [${clientIp}] 已连接 | 当前在线: ${onlineClients.size}`);
+
+  // 2. 监听客户端消息：收到后转发给所有在线客户端
+  serverWs.addEventListener("message", (event) => {
+    const clientMsg = event.data;
+    // 过滤空消息
+    if (!clientMsg || clientMsg.trim() === "") return;
+    
+    console.log(`[服务端] 收到 ${clientIp} 消息: ${clientMsg}`);
+    // 构造用户消息体，转发给所有客户端
+    broadcastUserMessage({
+      senderIp: clientIp,
+      message: clientMsg,
+      timestamp: new Date().toLocaleString()
+    });
+  });
+
+  // 3. 监听客户端断开连接：清理连接信息
+  serverWs.addEventListener("close", (event) => {
+    onlineClients.delete(serverWs);
+    console.log(`[服务端] 客户端 ${clientId} (${clientIp}) 已断开 | 在线数: ${onlineClients.size}`);
+    // 广播「客户端断开」系统消息
+    broadcastSystemMessage(`客户端 [${clientIp}] 已断开 | 当前在线: ${onlineClients.size}`);
+  });
+
+  // 4. 监听连接错误：清理异常连接
+  serverWs.addEventListener("error", (error) => {
+    console.error(`[服务端] 客户端 ${clientId} 错误:`, error);
+    onlineClients.delete(serverWs);
+  });
+
+  // 5. 心跳保活：防止Cloudflare自动断开连接（每25秒发一次ping）
+  const pingInterval = setInterval(() => {
+    if (serverWs.readyState !== WebSocket.OPEN) {
+      clearInterval(pingInterval);
+      return;
+    }
+    serverWs.ping(); // 服务端主动发ping，客户端无需响应
+  }, 25000);
+
+  // 6. 接受WebSocket连接（必须调用）
+  serverWs.accept();
+
+  // 7. 上下文绑定：确保心跳线程在连接关闭后销毁
+  ctx.waitUntil(new Promise((resolve) => {
+    serverWs.addEventListener("close", () => {
+      clearInterval(pingInterval);
+      resolve();
+    });
+  }));
+}
+
+/**
+ * 广播系统消息给所有在线客户端
+ * @param {string} content - 系统消息内容
+ */
+function broadcastSystemMessage(content) {
+  const message = JSON.stringify({
+    type: "system",
+    content: content,
+    timestamp: new Date().toLocaleString()
+  });
+  sendToAllClients(message);
+}
+
+/**
+ * 广播用户消息给所有在线客户端
+ * @param {object} data - 用户消息体 {senderIp, message, timestamp}
+ */
+function broadcastUserMessage(data) {
+  const message = JSON.stringify({
+    type: "user",
+    senderIp: data.senderIp,
+    message: data.message,
+    timestamp: data.timestamp
+  });
+  sendToAllClients(message);
+}
+
+/**
+ * 发送消息给所有在线客户端
+ * @param {string} message - 序列化后的JSON消息
+ */
+function sendToAllClients(message) {
+  for (const [clientWs] of onlineClients) {
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(message);
+    }
+  }
+}
